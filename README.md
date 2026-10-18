@@ -41,7 +41,7 @@ environment (e.g. `bombur-onboard myapp-test 8000 test`).
 ssh -p 10022 ciakval@bombur.remesh.cz
 cd /home/deploy/DOCKER/<app>
 sudo -u deploy docker compose ps / logs -f
-journalctl -t bombur-deploy            # deploy history
+sudo journalctl -t bombur-deploy       # deploy history
 # Rollback: re-run an older successful workflow run in GitHub, or
 sudo -u deploy sed -i 's/^IMAGE_TAG=.*/IMAGE_TAG=<old-sha>/' .env && sudo -u deploy docker compose up -d
 ```
