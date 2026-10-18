@@ -1,0 +1,84 @@
+#!/bin/sh
+# Admin side of onboarding an app on Bombur. Run as root (via sudo) by bombur-onboard:
+#
+#   tar -c [compose.yaml] [.env.example] key.pub | ssh ciakval@bombur sudo bombur-add-app <app> <port|-> <owner/repo>
+#
+# - creates ~deploy/DOCKER/<app>/{,data}
+# - installs compose.yaml / .env.example if they were sent (re-running refreshes compose.yaml)
+# - creates .env once from .env.example (CHANGE_ME values become random secrets); never overwrites it
+# - installs key.pub as the app's forced-command deploy key, replacing any previous one (= rotation)
+# - creates the Caddy site <app>.remesh.cz -> <app>-web:<port> if missing (port "-" skips this)
+#
+# Installed root-owned (0755) at /usr/local/sbin/bombur-add-app.
+set -eu
+
+DEPLOY_USER=deploy
+DEPLOY_HOME=/home/$DEPLOY_USER
+SITES=/home/ciakval/DOCKER/web/sites
+SITES_OWNER=ciakval
+DOMAIN=remesh.cz
+
+die() { echo "error: $*" >&2; exit 2; }
+
+[ $# -eq 3 ] || die "usage: bombur-add-app <app> <port|-> <owner/repo>"
+APP=$1 PORT=$2 REPO=$3
+case "$APP" in ""|*[!a-z0-9-]*) die "bad app name '$APP'" ;; esac
+case "$PORT" in -) ;; ""|*[!0-9]*) die "bad port '$PORT'" ;; esac
+printf '%s' "$REPO" | grep -Eqx '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+' || die "bad repo '$REPO'"
+
+D=$DEPLOY_HOME/DOCKER/$APP
+T=$(mktemp -d)
+trap 'rm -rf "$T"' EXIT
+tar -C "$T" -x
+[ -f "$T/key.pub" ] || die "key.pub missing from input"
+
+install -d -o $DEPLOY_USER -g $DEPLOY_USER -m 750 "$DEPLOY_HOME/DOCKER" "$D"
+install -d -o $DEPLOY_USER -g $DEPLOY_USER -m 755 "$D/data"
+for f in compose.yaml .env.example; do
+	if [ -f "$T/$f" ]; then install -o $DEPLOY_USER -g $DEPLOY_USER -m 640 "$T/$f" "$D/$f"; fi
+done
+[ -f "$D/compose.yaml" ] || die "no compose.yaml in $D (send one)"
+
+if [ ! -f "$D/.env" ]; then
+	if [ -f "$D/.env.example" ]; then
+		while IFS= read -r line || [ -n "$line" ]; do
+			case "$line" in
+				*=CHANGE_ME) echo "${line%%=*}=$(openssl rand -base64 48 | tr -d '/+=\n')" ;;
+				*) echo "$line" ;;
+			esac
+		done < "$D/.env.example" > "$D/.env"
+	fi
+	printf 'GITHUB_REPOSITORY=%s\nCONTAINER_NAME=%s-web\n' "$REPO" "$APP" >> "$D/.env"
+	chown $DEPLOY_USER:$DEPLOY_USER "$D/.env"
+	chmod 600 "$D/.env"
+	echo "created $D/.env (review it)"
+fi
+
+# Deploy key: drop any previous key for this app, then add the new one.
+KEY=$(head -n1 "$T/key.pub")
+case "$KEY" in "ssh-ed25519 "*" gh-$APP") ;; *) die "key.pub must be an ed25519 key with comment gh-$APP" ;; esac
+AK=$DEPLOY_HOME/.ssh/authorized_keys
+install -d -o $DEPLOY_USER -g $DEPLOY_USER -m 700 "$DEPLOY_HOME/.ssh"
+touch "$AK"
+grep -v " gh-$APP\$" "$AK" > "$AK.new" || true
+printf 'restrict,command="/usr/local/bin/bombur-deploy %s" %s\n' "$APP" "$KEY" >> "$AK.new"
+chown $DEPLOY_USER:$DEPLOY_USER "$AK.new"
+chmod 600 "$AK.new"
+mv "$AK.new" "$AK"
+echo "installed deploy key gh-$APP"
+
+[ "$PORT" = - ] && exit 0
+SITE=$SITES/$APP.caddy
+if [ -f "$SITE" ]; then
+	echo "Caddy site $SITE exists, left as is"
+	exit 0
+fi
+printf '%s.%s {\n\treverse_proxy %s-web:%s\n}\n' "$APP" "$DOMAIN" "$APP" "$PORT" > "$SITE"
+chown $SITES_OWNER:$SITES_OWNER "$SITE"
+if docker exec caddy caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
+	docker exec caddy caddy reload --config /etc/caddy/Caddyfile
+	echo "Caddy: $APP.$DOMAIN -> $APP-web:$PORT"
+else
+	rm -f "$SITE"
+	die "Caddy validation failed; site not added"
+fi

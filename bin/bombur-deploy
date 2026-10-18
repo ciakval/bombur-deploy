@@ -1,0 +1,53 @@
+#!/bin/sh
+# Forced command for CI deploy keys on Bombur. One key per app, in ~deploy/.ssh/authorized_keys:
+#
+#   restrict,command="/usr/local/bin/bombur-deploy <app>" ssh-ed25519 AAAA... gh-<app>
+#
+# The client sends "deploy <40-hex-sha>" as its command and, optionally, a GHCR token on
+# stdin (for private packages; used once, never stored). Everything else is fixed on the
+# server: the deploy dir, compose.yaml and the image name (GITHUB_REPOSITORY in .env).
+#
+# Installed root-owned (0755) at /usr/local/bin/bombur-deploy so the deploy user can't change it.
+set -eu
+
+log() { echo "$*"; logger -t bombur-deploy -- "$*" 2>/dev/null || true; }
+die() { echo "error: $*" >&2; logger -t bombur-deploy -- "rejected: $*" 2>/dev/null || true; exit 2; }
+
+APP="${1:-}"
+case "$APP" in ""|*[!a-z0-9-]*) die "bad app name '$APP'" ;; esac
+DIR="$HOME/DOCKER/$APP"
+[ -f "$DIR/compose.yaml" ] || die "unknown app '$APP'"
+
+case "${SSH_ORIGINAL_COMMAND:-}" in
+	"deploy "*) SHA="${SSH_ORIGINAL_COMMAND#deploy }" ;;
+	*) die "usage: deploy <40-hex-sha>" ;;
+esac
+printf '%s' "$SHA" | grep -Eqx '[0-9a-f]{40}' || die "bad sha '$SHA'"
+
+cd "$DIR"
+
+# One deploy per app at a time.
+exec 9>"$DIR/.deploy.lock"
+flock 9
+
+DOCKER_CONFIG="$(mktemp -d)"
+export DOCKER_CONFIG
+trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+if IFS= read -r TOKEN && [ -n "$TOKEN" ]; then
+	printf '%s' "$TOKEN" | docker login ghcr.io -u ci --password-stdin >/dev/null
+fi
+
+touch .env
+chmod 600 .env
+if grep -q '^IMAGE_TAG=' .env; then
+	sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=$SHA|" .env
+else
+	echo "IMAGE_TAG=$SHA" >> .env
+fi
+
+log "deploying $APP @ $SHA"
+docker compose pull --quiet
+docker compose up -d --remove-orphans
+# Shared host: prune images only (never `docker system prune`); keep recent ones for rollback.
+docker image prune -af --filter "until=72h" >/dev/null
+log "deployed $APP @ $SHA"

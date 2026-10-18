@@ -1,0 +1,81 @@
+# Reusable deploy to Bombur. Call it after building and pushing the image:
+#
+#   deploy:
+#     needs: build-and-push
+#     if: github.ref == 'refs/heads/main'
+#     permissions:
+#       contents: read
+#       packages: read
+#     uses: ciakval/bombur-deploy/.github/workflows/deploy.yml@v1
+#     with:
+#       image_tag: ${{ needs.build-and-push.outputs.image_tag }}
+#       url: https://myapp.remesh.cz
+#     secrets: inherit
+#
+# DEPLOY_SSH_KEY is an environment secret of the calling repo (see bombur-onboard). The key
+# only lets CI run "deploy <sha>" for the one app it was issued for.
+name: Deploy to Bombur
+
+on:
+  workflow_call:
+    inputs:
+      image_tag:
+        description: Full git SHA the image was tagged with
+        required: true
+        type: string
+      environment:
+        description: GitHub environment holding DEPLOY_SSH_KEY
+        type: string
+        default: production
+      url:
+        description: Public URL of the app (shown in GitHub; health-checked if health_path is set)
+        type: string
+        default: ''
+      health_path:
+        description: Path under url that must return 2xx after deploy, e.g. /health
+        type: string
+        default: ''
+
+env:
+  BOMBUR_HOST: bombur.remesh.cz
+  BOMBUR_PORT: '10022'
+  BOMBUR_KNOWN_HOST: '[bombur.remesh.cz]:10022 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFD7gmRdS+5881iKmZLZ7ofSmDyNNxiPsxfKsKfh0wvw'
+
+jobs:
+  deploy:
+    name: Deploy (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ inputs.url }}
+    concurrency:
+      group: bombur-deploy-${{ github.repository }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - name: Deploy
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -eu
+          [ -n "$SSH_KEY" ] || { echo "DEPLOY_SSH_KEY is not set in environment '${{ inputs.environment }}'"; exit 1; }
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/bombur
+          chmod 600 ~/.ssh/bombur
+          printf '%s\n' "$BOMBUR_KNOWN_HOST" > ~/.ssh/known_hosts
+          printf '%s\n' "$GHCR_TOKEN" | ssh -i ~/.ssh/bombur -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            -p "$BOMBUR_PORT" "deploy@$BOMBUR_HOST" "deploy $IMAGE_TAG"
+
+      - name: Health check
+        if: inputs.url != '' && inputs.health_path != ''
+        run: |
+          for i in $(seq 1 20); do
+            curl -fsS -o /dev/null "${{ inputs.url }}${{ inputs.health_path }}" && { echo "healthy"; exit 0; }
+            sleep 3
+          done
+          echo "health check failed: ${{ inputs.url }}${{ inputs.health_path }}"
+          exit 1

@@ -1,0 +1,38 @@
+#!/bin/sh
+# Onboard an app (or rotate its deploy key). Run from the app's repo root on your machine:
+#
+#   bombur-onboard <app> <port|-> [github-environment]
+#
+# Sends ./compose.yaml and ./.env.example (if present) plus a fresh deploy public key to
+# Bombur (bombur-add-app), then stores the private key as DEPLOY_SSH_KEY in the repo's
+# GitHub environment (default: production). The private key never leaves this machine
+# except to GitHub. Port "-" skips creating the Caddy site.
+# Set BOMBUR_KEY_ONLY=1 to send just the key (e.g. rotation without touching compose.yaml).
+set -eu
+
+ADMIN=${BOMBUR_ADMIN:-ciakval@bombur.remesh.cz}
+SSH_PORT=10022
+
+[ $# -ge 2 ] || { echo "usage: bombur-onboard <app> <port|-> [github-environment]" >&2; exit 2; }
+APP=$1 PORT=$2 ENVIRONMENT=${3:-production}
+REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+
+T=$(mktemp -d)
+trap 'rm -rf "$T"' EXIT
+ssh-keygen -q -t ed25519 -N '' -C "gh-$APP" -f "$T/key"
+if [ -z "${BOMBUR_KEY_ONLY:-}" ]; then
+	for f in compose.yaml .env.example; do if [ -f "$f" ]; then cp "$f" "$T/"; fi; done
+fi
+
+(cd "$T" && tar -c $(ls -A | grep -vx key)) |
+	ssh -p $SSH_PORT "$ADMIN" sudo /usr/local/sbin/bombur-add-app "$APP" "$PORT" "$REPO"
+
+# Create the environment only if missing, so existing deployment policies are kept.
+if ! gh api "repos/$REPO/environments/$ENVIRONMENT" >/dev/null 2>&1; then
+	gh api -X PUT "repos/$REPO/environments/$ENVIRONMENT" \
+		-F 'deployment_branch_policy[protected_branches]=true' \
+		-F 'deployment_branch_policy[custom_branch_policies]=false' >/dev/null
+	echo "created GitHub environment '$ENVIRONMENT' (protected branches only)"
+fi
+gh secret set DEPLOY_SSH_KEY --env "$ENVIRONMENT" --repo "$REPO" < "$T/key"
+echo "Done. Review ~deploy/DOCKER/$APP/.env on Bombur, then push to deploy."
